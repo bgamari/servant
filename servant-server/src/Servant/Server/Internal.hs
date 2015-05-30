@@ -171,8 +171,8 @@ newtype RouteResult a =
 
 runAction :: IO (RouteResult (EitherT ServantErr IO a))
           -> IO (Either RouteMismatch (Either ServantErr a))
-runAction a = do
-  r <- a
+runAction action = do
+  r <- action
   go r
   where
     go (RR (Right a))  = Right <$> runEitherT a
