@@ -54,14 +54,30 @@ import           Servant.Common.Text         (FromText, fromText)
 
 import           Servant.Server.Internal.ServantErr
 
+-- | Internal representation of a router.
 data Router =
     WithRequest   (Request -> Router)
+      -- ^ current request is passed to the router
   | StaticRouter  (M.Map Text Router)
+      -- ^ first path component used for lookup and removed afterwards
   | DynamicRouter (Text -> Router)
+      -- ^ first path component used for lookup and removed afterwards
   | LeafRouter    RoutingApplication
+      -- ^ to be used for routes that match an empty path
   | Choice        Router Router
+      -- ^ left-biased choice between two routers
 
--- TODO: There are potentially many more cases we can optimize!
+-- | Smart constructor for the choice between routers.
+-- We currently optimize the following cases:
+--
+--   * Two static routers can be joined by joining their maps.
+--   * Two dynamic routers can be joined by joining their codomains.
+--   * Two 'WithRequest' routers can be joined by passing them
+--     the same request and joining their codomains.
+--   * A 'WithRequest' router can be joined with anything else by
+--     passing the same request to both but ignoring it in the
+--     component that does not need it.
+--
 choice :: Router -> Router -> Router
 choice (StaticRouter table1) (StaticRouter table2) =
   StaticRouter (M.unionWith choice table1 table2)
@@ -75,6 +91,7 @@ choice router1 (WithRequest router2) =
   WithRequest (\ request -> choice router1 (router2 request))
 choice router1 router2 = Choice router1 router2
 
+-- | Interpret a router as an application.
 runRouter :: Router -> RoutingApplication
 runRouter (WithRequest router) request respond =
   runRouter (router request) request respond
