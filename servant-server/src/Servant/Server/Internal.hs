@@ -57,7 +57,7 @@ import           Servant.Server.Internal.ServantErr
 data Router =
     WithRequest   (Request -> Router)
   | StaticRouter  (M.Map Text Router)
-  | DynamicRouter (Text -> RouteResult Router)
+  | DynamicRouter (Text -> Router)
   | LeafRouter    RoutingApplication
   | Choice        Router Router
 
@@ -65,6 +65,8 @@ data Router =
 choice :: Router -> Router -> Router
 choice (StaticRouter table1) (StaticRouter table2) =
   StaticRouter (M.unionWith choice table1 table2)
+choice (DynamicRouter fun1)  (DynamicRouter fun2)  =
+  DynamicRouter (\ first -> choice (fun1 first) (fun2 first))
 choice (WithRequest router1) (WithRequest router2) =
   WithRequest (\ request -> choice (router1 request) (router2 request))
 choice (WithRequest router1) router2 =
@@ -87,9 +89,7 @@ runRouter (DynamicRouter fun)  request respond =
   case processedPathInfo request of
     first : rest
       -> let request' = request { pathInfo = rest }
-         in  case fun first of
-               RR (Left err)     -> respond (RR (Left err))
-               RR (Right router) -> runRouter router request' respond
+         in  runRouter (fun first) request' respond
     _ -> respond $ failWith NotFound
 runRouter (LeafRouter app)     request respond = app request respond
 runRouter (Choice r1 r2)       request respond =
@@ -306,10 +306,10 @@ instance (KnownSymbol capture, FromText a, HasServer sublayout)
 
   route Proxy subserver =
     DynamicRouter $ \ first ->
-      case captured captureProxy first of
-        Nothing  -> failWith NotFound
-        Just v   -> succeedWith $ route (Proxy :: Proxy sublayout)
-                                        (feedTo subserver v)
+      route (Proxy :: Proxy sublayout)
+            (case captured captureProxy first of
+               Nothing  -> return $ failWith NotFound
+               Just v   -> feedTo subserver v)
     where captureProxy = Proxy :: Proxy (Capture capture a)
 
 
