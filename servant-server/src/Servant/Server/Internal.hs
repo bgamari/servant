@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds            #-}
 {-# LANGUAGE FlexibleContexts     #-}
 {-# LANGUAGE FlexibleInstances    #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings    #-}
 {-# LANGUAGE PolyKinds            #-}
 {-# LANGUAGE ScopedTypeVariables  #-}
@@ -14,7 +15,7 @@
 module Servant.Server.Internal where
 
 #if !MIN_VERSION_base(4,8,0)
-import           Control.Applicative         ((<$>))
+import           Control.Applicative         (Applicative, (<$>))
 import           Data.Monoid                 (Monoid, mappend, mempty)
 #endif
 import           Control.Monad.Trans.Either  (EitherT, runEitherT)
@@ -54,7 +55,8 @@ import           Servant.Common.Text         (FromText, fromText)
 import           Servant.Server.Internal.ServantErr
 
 data Router =
-    StaticRouter  (M.Map Text Router)
+    WithRequest   (Request -> Router)
+  | StaticRouter  (M.Map Text Router)
   | DynamicRouter (Text -> RouteResult Router)
   | LeafRouter    RoutingApplication
   | Choice        Router Router
@@ -63,9 +65,17 @@ data Router =
 choice :: Router -> Router -> Router
 choice (StaticRouter table1) (StaticRouter table2) =
   StaticRouter (M.unionWith choice table1 table2)
+choice (WithRequest router1) (WithRequest router2) =
+  WithRequest (\ request -> choice (router1 request) (router2 request))
+choice (WithRequest router1) router2 =
+  WithRequest (\ request -> choice (router1 request) router2)
+choice router1 (WithRequest router2) =
+  WithRequest (\ request -> choice router1 (router2 request))
 choice router1 router2 = Choice router1 router2
 
 runRouter :: Router -> RoutingApplication
+runRouter (WithRequest router) request respond =
+  runRouter (router request) request respond
 runRouter (StaticRouter table) request respond =
   case processedPathInfo request of
     first : rest
@@ -157,7 +167,27 @@ instance Monoid RouteMismatch where
 -- | A wrapper around @'Either' 'RouteMismatch' a@.
 newtype RouteResult a =
   RR { routeResult :: Either RouteMismatch a }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Functor, Applicative)
+
+runAction :: IO (RouteResult (EitherT ServantErr IO a))
+          -> IO (Either RouteMismatch (Either ServantErr a))
+runAction a = do
+  r <- a
+  go r
+  where
+    go (RR (Right a))  = Right <$> runEitherT a
+    go (RR (Left err)) = return $ Left err
+
+feedTo :: IO (RouteResult (a -> b)) -> a -> IO (RouteResult b)
+feedTo f x = (($ x) <$>) <$> f
+
+extractL :: RouteResult (a :<|> b) -> RouteResult a
+extractL (RR (Right (a :<|> _))) = RR (Right a)
+extractL (RR (Left err))         = RR (Left err)
+
+extractR :: RouteResult (a :<|> b) -> RouteResult b
+extractR (RR (Right (_ :<|> b))) = RR (Right b)
+extractR (RR (Left err))         = RR (Left err)
 
 failWith :: RouteMismatch -> RouteResult a
 failWith = RR . Left
@@ -216,7 +246,7 @@ processedPathInfo r =
 class HasServer layout where
   type ServerT layout (m :: * -> *) :: *
 
-  route :: Proxy layout -> Server layout -> Router
+  route :: Proxy layout -> IO (RouteResult (Server layout)) -> Router
 
 type Server layout = ServerT layout (EitherT ServantErr IO)
 
@@ -237,7 +267,8 @@ instance (HasServer a, HasServer b) => HasServer (a :<|> b) where
 
   type ServerT (a :<|> b) m = ServerT a m :<|> ServerT b m
 
-  route Proxy (a :<|> b) = choice (route pa a) (route pb b)
+  route Proxy server = choice (route pa (extractL <$> server))
+                              (route pb (extractR <$> server))
     where pa = Proxy :: Proxy a
           pb = Proxy :: Proxy b
 
@@ -271,7 +302,8 @@ instance (KnownSymbol capture, FromText a, HasServer sublayout)
     DynamicRouter $ \ first ->
       case captured captureProxy first of
         Nothing  -> failWith NotFound
-        Just v   -> succeedWith $ route (Proxy :: Proxy sublayout) (subserver v)
+        Just v   -> succeedWith $ route (Proxy :: Proxy sublayout)
+                                        (feedTo subserver v)
     where captureProxy = Proxy :: Proxy (Capture capture a)
 
 
@@ -299,15 +331,16 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodDelete = do
-            e <- runEitherT action
+            e <- runAction action
             respond $ case e of
-              Right output -> do
+              Right (Right output) -> do
                 let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
                 case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
                   Nothing -> failWith UnsupportedMediaType
                   Just (contentT, body) -> succeedWith $
                     responseLBS status200 [ ("Content-Type" , cs contentT)] body
-              Left err -> succeedWith $ responseServantErr err
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err         -> failWith err
         | pathIsEmpty request && requestMethod request /= methodDelete =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -324,10 +357,11 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodDelete = do
-            e <- runEitherT action
-            respond . succeedWith $ case e of
-              Right () -> responseLBS noContent204 [] ""
-              Left err -> responseServantErr err
+            e <- runAction action
+            respond $ case e of
+              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err         -> failWith err
         | pathIsEmpty request && requestMethod request /= methodDelete =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -346,16 +380,17 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodDelete = do
-          e <- runEitherT action
+          e <- runAction action
           respond $ case e of
-            Right output -> do
+            Right (Right output) -> do
               let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
                   headers = getHeaders output
               case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
                 Nothing -> failWith UnsupportedMediaType
                 Just (contentT, body) -> succeedWith $
                   responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
-            Left err -> succeedWith $ responseServantErr err
+            Right (Left err) -> succeedWith $ responseServantErr err
+            Left err -> failWith err
         | pathIsEmpty request && requestMethod request /= methodDelete =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -385,15 +420,16 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodGet = do
-            e <- runEitherT action
+            e <- runAction action
             respond $ case e of
-              Right output -> do
+              Right (Right output) -> do
                 let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
                 case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
                   Nothing -> failWith UnsupportedMediaType
                   Just (contentT, body) -> succeedWith $
                     responseLBS ok200 [ ("Content-Type" , cs contentT)] body
-              Left err -> succeedWith $ responseServantErr err
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err -> failWith err
         | pathIsEmpty request && requestMethod request /= methodGet =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -411,10 +447,11 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodGet = do
-            e <- runEitherT action
-            respond . succeedWith $ case e of
-              Right () -> responseLBS noContent204 [] ""
-              Left err -> responseServantErr err
+            e <- runAction action
+            respond $ case e of
+              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err         -> failWith err
         | pathIsEmpty request && requestMethod request /= methodGet =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -433,16 +470,17 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodGet = do
-          e <- runEitherT action
+          e <- runAction action
           respond $ case e of
-            Right output -> do
+            Right (Right output) -> do
               let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
                   headers = getHeaders output
               case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
                 Nothing -> failWith UnsupportedMediaType
                 Just (contentT, body) -> succeedWith $
                   responseLBS ok200 ( ("Content-Type" , cs contentT) : headers) body
-            Left err -> succeedWith $ responseServantErr err
+            Right (Left err) -> succeedWith $ responseServantErr err
+            Left err         -> failWith err
         | pathIsEmpty request && requestMethod request /= methodGet =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -473,11 +511,10 @@ instance (KnownSymbol sym, FromText a, HasServer sublayout)
   type ServerT (Header sym a :> sublayout) m =
     Maybe a -> ServerT sublayout m
 
-  route Proxy subserver request respond = do
+  route Proxy subserver = WithRequest $ \ request ->
     let mheader = fromText . decodeUtf8 =<< lookup str (requestHeaders request)
-    route (Proxy :: Proxy sublayout) (subserver mheader) request respond
-
-      where str = fromString $ symbolVal (Proxy :: Proxy sym)
+    in  route (Proxy :: Proxy sublayout) (feedTo subserver mheader)
+    where str = fromString $ symbolVal (Proxy :: Proxy sym)
 
 -- | When implementing the handler for a 'Post' endpoint,
 -- just like for 'Servant.API.Delete.Delete', 'Servant.API.Get.Get'
@@ -501,20 +538,23 @@ instance
 
   type ServerT (Post ctypes a) m = m a
 
-  route Proxy action request respond
-    | pathIsEmpty request && requestMethod request == methodPost = do
-        e <- runEitherT action
-        respond $ case e of
-          Right output -> do
-            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-              Nothing -> failWith UnsupportedMediaType
-              Just (contentT, body) -> succeedWith $
-                responseLBS status201 [ ("Content-Type" , cs contentT)] body
-          Left err -> succeedWith $ responseServantErr err
-    | pathIsEmpty request && requestMethod request /= methodPost =
-        respond $ failWith WrongMethod
-    | otherwise = respond $ failWith NotFound
+  route Proxy action = LeafRouter route'
+    where
+      route' request respond
+        | pathIsEmpty request && requestMethod request == methodPost = do
+            e <- runAction action
+            respond $ case e of
+              Right (Right output) -> do
+                let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
+                  Nothing -> failWith UnsupportedMediaType
+                  Just (contentT, body) -> succeedWith $
+                    responseLBS status201 [ ("Content-Type" , cs contentT)] body
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err -> failWith err
+        | pathIsEmpty request && requestMethod request /= methodPost =
+            respond $ failWith WrongMethod
+        | otherwise = respond $ failWith NotFound
 
 instance
 #if MIN_VERSION_base(4,8,0)
@@ -524,15 +564,18 @@ instance
 
   type ServerT (Post ctypes ()) m = m ()
 
-  route Proxy action request respond
-    | pathIsEmpty request && requestMethod request == methodPost = do
-        e <- runEitherT action
-        respond . succeedWith $ case e of
-          Right () -> responseLBS noContent204 [] ""
-          Left err -> responseServantErr err
-    | pathIsEmpty request && requestMethod request /= methodPost =
-        respond $ failWith WrongMethod
-    | otherwise = respond $ failWith NotFound
+  route Proxy action = LeafRouter route'
+    where
+      route' request respond
+        | pathIsEmpty request && requestMethod request == methodPost = do
+            e <- runAction action
+            respond $ case e of
+              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err         -> failWith err
+        | pathIsEmpty request && requestMethod request /= methodPost =
+            respond $ failWith WrongMethod
+        | otherwise = respond $ failWith NotFound
 
 -- Add response headers
 instance
@@ -544,21 +587,24 @@ instance
 
   type ServerT (Post ctypes (Headers h v)) m = m (Headers h v)
 
-  route Proxy action request respond
-    | pathIsEmpty request && requestMethod request == methodPost = do
-      e <- runEitherT action
-      respond $ case e of
-        Right output -> do
-          let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-              headers = getHeaders output
-          case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-            Nothing -> failWith UnsupportedMediaType
-            Just (contentT, body) -> succeedWith $
-              responseLBS status201 ( ("Content-Type" , cs contentT) : headers) body
-        Left err -> succeedWith $ responseServantErr err
-    | pathIsEmpty request && requestMethod request /= methodPost =
-        respond $ failWith WrongMethod
-    | otherwise = respond $ failWith NotFound
+  route Proxy action = LeafRouter route'
+    where
+      route' request respond
+        | pathIsEmpty request && requestMethod request == methodPost = do
+          e <- runAction action
+          respond $ case e of
+            Right (Right output) -> do
+              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                  headers = getHeaders output
+              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
+                Nothing -> failWith UnsupportedMediaType
+                Just (contentT, body) -> succeedWith $
+                  responseLBS status201 ( ("Content-Type" , cs contentT) : headers) body
+            Right (Left err) -> succeedWith $ responseServantErr err
+            Left err         -> failWith err
+        | pathIsEmpty request && requestMethod request /= methodPost =
+            respond $ failWith WrongMethod
+        | otherwise = respond $ failWith NotFound
 
 -- | When implementing the handler for a 'Put' endpoint,
 -- just like for 'Servant.API.Delete.Delete', 'Servant.API.Get.Get'
@@ -581,20 +627,23 @@ instance
 
   type ServerT (Put ctypes a) m = m a
 
-  route Proxy action request respond
-    | pathIsEmpty request && requestMethod request == methodPut = do
-        e <- runEitherT action
-        respond $ case e of
-          Right output -> do
-            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-              Nothing -> failWith UnsupportedMediaType
-              Just (contentT, body) -> succeedWith $
-                responseLBS status200 [ ("Content-Type" , cs contentT)] body
-          Left err -> succeedWith $ responseServantErr err
-    | pathIsEmpty request && requestMethod request /= methodPut =
-        respond $ failWith WrongMethod
-    | otherwise = respond $ failWith NotFound
+  route Proxy action = LeafRouter route'
+    where
+      route' request respond
+        | pathIsEmpty request && requestMethod request == methodPut = do
+            e <- runAction action
+            respond $ case e of
+              Right (Right output) -> do
+                let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
+                  Nothing -> failWith UnsupportedMediaType
+                  Just (contentT, body) -> succeedWith $
+                    responseLBS status200 [ ("Content-Type" , cs contentT)] body
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err -> failWith err
+        | pathIsEmpty request && requestMethod request /= methodPut =
+            respond $ failWith WrongMethod
+        | otherwise = respond $ failWith NotFound
 
 instance
 #if MIN_VERSION_base(4,8,0)
@@ -604,15 +653,18 @@ instance
 
   type ServerT (Put ctypes ()) m = m ()
 
-  route Proxy action request respond
-    | pathIsEmpty request && requestMethod request == methodPut = do
-        e <- runEitherT action
-        respond . succeedWith $ case e of
-          Right () -> responseLBS noContent204 [] ""
-          Left err -> responseServantErr err
-    | pathIsEmpty request && requestMethod request /= methodPut =
-        respond $ failWith WrongMethod
-    | otherwise = respond $ failWith NotFound
+  route Proxy action = LeafRouter route'
+    where
+      route' request respond
+        | pathIsEmpty request && requestMethod request == methodPut = do
+            e <- runAction action
+            respond $ case e of
+              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err         -> failWith err
+        | pathIsEmpty request && requestMethod request /= methodPut =
+            respond $ failWith WrongMethod
+        | otherwise = respond $ failWith NotFound
 
 -- Add response headers
 instance
@@ -624,21 +676,24 @@ instance
 
   type ServerT (Put ctypes (Headers h v)) m = m (Headers h v)
 
-  route Proxy action request respond
-    | pathIsEmpty request && requestMethod request == methodPut = do
-      e <- runEitherT action
-      respond $ case e of
-        Right output -> do
-          let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-              headers = getHeaders output
-          case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-            Nothing -> failWith UnsupportedMediaType
-            Just (contentT, body) -> succeedWith $
-              responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
-        Left err -> succeedWith $ responseServantErr err
-    | pathIsEmpty request && requestMethod request /= methodPut =
-        respond $ failWith WrongMethod
-    | otherwise = respond $ failWith NotFound
+  route Proxy action = LeafRouter route'
+    where
+      route' request respond
+        | pathIsEmpty request && requestMethod request == methodPut = do
+          e <- runAction action
+          respond $ case e of
+            Right (Right output) -> do
+              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                  headers = getHeaders output
+              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
+                Nothing -> failWith UnsupportedMediaType
+                Just (contentT, body) -> succeedWith $
+                  responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
+            Right (Left err) -> succeedWith $ responseServantErr err
+            Left err -> failWith err
+        | pathIsEmpty request && requestMethod request /= methodPut =
+            respond $ failWith WrongMethod
+        | otherwise = respond $ failWith NotFound
 
 -- | When implementing the handler for a 'Patch' endpoint,
 -- just like for 'Servant.API.Delete.Delete', 'Servant.API.Get.Get'
@@ -659,20 +714,23 @@ instance
 
   type ServerT (Patch ctypes a) m = m a
 
-  route Proxy action request respond
-    | pathIsEmpty request && requestMethod request == methodPatch = do
-        e <- runEitherT action
-        respond $ case e of
-          Right output -> do
-            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-              Nothing -> failWith UnsupportedMediaType
-              Just (contentT, body) -> succeedWith $
-                responseLBS status200 [ ("Content-Type" , cs contentT)] body
-          Left err -> succeedWith $ responseServantErr err
-    | pathIsEmpty request && requestMethod request /= methodPatch =
-        respond $ failWith WrongMethod
-    | otherwise = respond $ failWith NotFound
+  route Proxy action = LeafRouter route'
+    where
+      route' request respond
+        | pathIsEmpty request && requestMethod request == methodPatch = do
+            e <- runAction action
+            respond $ case e of
+              Right (Right output) -> do
+                let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
+                  Nothing -> failWith UnsupportedMediaType
+                  Just (contentT, body) -> succeedWith $
+                    responseLBS status200 [ ("Content-Type" , cs contentT)] body
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err -> failWith err
+        | pathIsEmpty request && requestMethod request /= methodPatch =
+            respond $ failWith WrongMethod
+        | otherwise = respond $ failWith NotFound
 
 instance
 #if MIN_VERSION_base(4,8,0)
@@ -682,15 +740,18 @@ instance
 
   type ServerT (Patch ctypes ()) m = m ()
 
-  route Proxy action request respond
-    | pathIsEmpty request && requestMethod request == methodPatch = do
-        e <- runEitherT action
-        respond . succeedWith $ case e of
-          Right () -> responseLBS noContent204 [] ""
-          Left err -> responseServantErr err
-    | pathIsEmpty request && requestMethod request /= methodPatch =
-        respond $ failWith WrongMethod
-    | otherwise = respond $ failWith NotFound
+  route Proxy action = LeafRouter route'
+    where
+      route' request respond
+        | pathIsEmpty request && requestMethod request == methodPatch = do
+            e <- runAction action
+            respond $ case e of
+              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
+              Right (Left err) -> succeedWith $ responseServantErr err
+              Left err         -> failWith err
+        | pathIsEmpty request && requestMethod request /= methodPatch =
+            respond $ failWith WrongMethod
+        | otherwise = respond $ failWith NotFound
 
 -- Add response headers
 instance
@@ -702,21 +763,24 @@ instance
 
   type ServerT (Patch ctypes (Headers h v)) m = m (Headers h v)
 
-  route Proxy action request respond
-    | pathIsEmpty request && requestMethod request == methodPatch = do
-      e <- runEitherT action
-      respond $ case e of
-        Right outpatch -> do
-          let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-              headers = getHeaders outpatch
-          case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse outpatch) of
-            Nothing -> failWith UnsupportedMediaType
-            Just (contentT, body) -> succeedWith $
-              responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
-        Left err -> succeedWith $ responseServantErr err
-    | pathIsEmpty request && requestMethod request /= methodPatch =
-        respond $ failWith WrongMethod
-    | otherwise = respond $ failWith NotFound
+  route Proxy action = LeafRouter route'
+    where
+      route' request respond
+        | pathIsEmpty request && requestMethod request == methodPatch = do
+          e <- runAction action
+          respond $ case e of
+            Right (Right outpatch) -> do
+              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                  headers = getHeaders outpatch
+              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse outpatch) of
+                Nothing -> failWith UnsupportedMediaType
+                Just (contentT, body) -> succeedWith $
+                  responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
+            Right (Left err) -> succeedWith $ responseServantErr err
+            Left err -> failWith err
+        | pathIsEmpty request && requestMethod request /= methodPatch =
+            respond $ failWith WrongMethod
+        | otherwise = respond $ failWith NotFound
 
 -- | If you use @'QueryParam' "author" Text@ in one of the endpoints for your API,
 -- this automatically requires your server-side handler to be a function
@@ -745,7 +809,7 @@ instance (KnownSymbol sym, FromText a, HasServer sublayout)
   type ServerT (QueryParam sym a :> sublayout) m =
     Maybe a -> ServerT sublayout m
 
-  route Proxy subserver request respond = do
+  route Proxy subserver = WithRequest $ \ request ->
     let querytext = parseQueryText $ rawQueryString request
         param =
           case lookup paramname querytext of
@@ -753,9 +817,7 @@ instance (KnownSymbol sym, FromText a, HasServer sublayout)
             Just Nothing  -> Nothing -- param present with no value -> Nothing
             Just (Just v) -> fromText v -- if present, we try to convert to
                                         -- the right type
-
-    route (Proxy :: Proxy sublayout) (subserver param) request respond
-
+    in route (Proxy :: Proxy sublayout) (feedTo subserver param)
     where paramname = cs $ symbolVal (Proxy :: Proxy sym)
 
 -- | If you use @'QueryParams' "authors" Text@ in one of the endpoints for your API,
@@ -783,16 +845,14 @@ instance (KnownSymbol sym, FromText a, HasServer sublayout)
   type ServerT (QueryParams sym a :> sublayout) m =
     [a] -> ServerT sublayout m
 
-  route Proxy subserver request respond = do
+  route Proxy subserver = WithRequest $ \ request ->
     let querytext = parseQueryText $ rawQueryString request
         -- if sym is "foo", we look for query string parameters
         -- named "foo" or "foo[]" and call fromText on the
         -- corresponding values
         parameters = filter looksLikeParam querytext
         values = catMaybes $ map (convert . snd) parameters
-
-    route (Proxy :: Proxy sublayout) (subserver values) request respond
-
+    in  route (Proxy :: Proxy sublayout) (feedTo subserver values)
     where paramname = cs $ symbolVal (Proxy :: Proxy sym)
           looksLikeParam (name, _) = name == paramname || name == (paramname <> "[]")
           convert Nothing = Nothing
@@ -816,15 +876,13 @@ instance (KnownSymbol sym, HasServer sublayout)
   type ServerT (QueryFlag sym :> sublayout) m =
     Bool -> ServerT sublayout m
 
-  route Proxy subserver request respond = do
+  route Proxy subserver = WithRequest $ \ request ->
     let querytext = parseQueryText $ rawQueryString request
         param = case lookup paramname querytext of
           Just Nothing  -> True  -- param is there, with no value
           Just (Just v) -> examine v -- param with a value
           Nothing       -> False -- param not in the query string
-
-    route (Proxy :: Proxy sublayout) (subserver param) request respond
-
+    in  route (Proxy :: Proxy sublayout) (feedTo subserver param)
     where paramname = cs $ symbolVal (Proxy :: Proxy sym)
           examine v | v == "true" || v == "1" || v == "" = True
                     | otherwise = False
@@ -859,16 +917,17 @@ instance (KnownSymbol sym, FromText a, HasServer sublayout)
   type ServerT (MatrixParam sym a :> sublayout) m =
     Maybe a -> ServerT sublayout m
 
-  route Proxy subserver request respond = case parsePathInfo request of
-    (first : _)
-      -> do let querytext = parseMatrixText . encodeUtf8 $ T.tail first
-                param = case lookup paramname querytext of
-                  Nothing       -> Nothing -- param absent from the query string
-                  Just Nothing  -> Nothing -- param present with no value -> Nothing
-                  Just (Just v) -> fromText v -- if present, we try to convert to
-                                        -- the right type
-            route (Proxy :: Proxy sublayout) (subserver param) request respond
-    _ -> route (Proxy :: Proxy sublayout) (subserver Nothing) request respond
+  route Proxy subserver = WithRequest $ \ request ->
+    case parsePathInfo request of
+      (first : _)
+        -> do let querytext = parseMatrixText . encodeUtf8 $ T.tail first
+                  param = case lookup paramname querytext of
+                    Nothing       -> Nothing -- param absent from the query string
+                    Just Nothing  -> Nothing -- param present with no value -> Nothing
+                    Just (Just v) -> fromText v -- if present, we try to convert to
+                                          -- the right type
+              route (Proxy :: Proxy sublayout) (feedTo subserver param)
+      _   -> route (Proxy :: Proxy sublayout) (feedTo subserver Nothing)
 
     where paramname = cs $ symbolVal (Proxy :: Proxy sym)
 
@@ -897,16 +956,17 @@ instance (KnownSymbol sym, FromText a, HasServer sublayout)
   type ServerT (MatrixParams sym a :> sublayout) m =
     [a] -> ServerT sublayout m
 
-  route Proxy subserver request respond = case parsePathInfo request of
-    (first : _)
-      -> do let matrixtext = parseMatrixText . encodeUtf8 $ T.tail first
-                -- if sym is "foo", we look for matrix parameters
-                -- named "foo" or "foo[]" and call fromText on the
-                -- corresponding values
-                parameters = filter looksLikeParam matrixtext
-                values = catMaybes $ map (convert . snd) parameters
-            route (Proxy :: Proxy sublayout) (subserver values) request respond
-    _ -> route (Proxy :: Proxy sublayout) (subserver []) request respond
+  route Proxy subserver = WithRequest $ \ request ->
+    case parsePathInfo request of
+      (first : _)
+        -> do let matrixtext = parseMatrixText . encodeUtf8 $ T.tail first
+                  -- if sym is "foo", we look for matrix parameters
+                  -- named "foo" or "foo[]" and call fromText on the
+                  -- corresponding values
+                  parameters = filter looksLikeParam matrixtext
+                  values = catMaybes $ map (convert . snd) parameters
+              route (Proxy :: Proxy sublayout) (feedTo subserver values)
+      _ -> route (Proxy :: Proxy sublayout) (feedTo subserver [])
 
     where paramname = cs $ symbolVal (Proxy :: Proxy sym)
           looksLikeParam (name, _) = name == paramname || name == (paramname <> "[]")
@@ -931,17 +991,18 @@ instance (KnownSymbol sym, HasServer sublayout)
   type ServerT (MatrixFlag sym :> sublayout) m =
     Bool -> ServerT sublayout m
 
-  route Proxy subserver request respond =  case parsePathInfo request of
-    (first : _)
-      -> do let matrixtext = parseMatrixText . encodeUtf8 $ T.tail first
-                param = case lookup paramname matrixtext of
-                  Just Nothing  -> True  -- param is there, with no value
-                  Just (Just v) -> examine v -- param with a value
-                  Nothing       -> False -- param not in the query string
-
-            route (Proxy :: Proxy sublayout) (subserver param) request respond
-
-    _ -> route (Proxy :: Proxy sublayout) (subserver False) request respond
+  route Proxy subserver = WithRequest $ \ request ->
+    case parsePathInfo request of
+      (first : _)
+        -> do let matrixtext = parseMatrixText . encodeUtf8 $ T.tail first
+                  param = case lookup paramname matrixtext of
+                    Just Nothing  -> True  -- param is there, with no value
+                    Just (Just v) -> examine v -- param with a value
+                    Nothing       -> False -- param not in the query string
+  
+              route (Proxy :: Proxy sublayout) (feedTo subserver param)
+  
+      _ -> route (Proxy :: Proxy sublayout) (feedTo subserver False)
 
     where paramname = cs $ symbolVal (Proxy :: Proxy sym)
           examine v | v == "true" || v == "1" || v == "" = True
@@ -959,8 +1020,11 @@ instance HasServer Raw where
 
   type ServerT Raw m = Application
 
-  route Proxy rawApplication request respond =
-    rawApplication request (respond . succeedWith)
+  route Proxy rawApplication = LeafRouter $ \ request respond -> do
+    r <- rawApplication
+    case r of
+      RR (Left err)  -> respond $ failWith err
+      RR (Right app) -> app request (respond . succeedWith)
 
 -- | If you use 'ReqBody' in one of the endpoints for your API,
 -- this automatically requires your server-side handler to be a function
@@ -988,19 +1052,20 @@ instance ( AllCTUnrender list a, HasServer sublayout
   type ServerT (ReqBody list a :> sublayout) m =
     a -> ServerT sublayout m
 
-  route Proxy subserver request respond = do
-    -- See HTTP RFC 2616, section 7.2.1
-    -- http://www.w3.org/Protocols/rfc2616/rfc2616-sec7.html#sec7.2.1
-    -- See also "W3C Internet Media Type registration, consistency of use"
-    -- http://www.w3.org/2001/tag/2002/0129-mime
-    let contentTypeH = fromMaybe "application/octet-stream"
-                     $ lookup hContentType $ requestHeaders request
-    mrqbody <- handleCTypeH (Proxy :: Proxy list) (cs contentTypeH)
-           <$> lazyRequestBody request
-    case mrqbody of
-      Nothing -> respond . failWith $ UnsupportedMediaType
-      Just (Left e) -> respond . failWith $ InvalidBody e
-      Just (Right v) -> route (Proxy :: Proxy sublayout) (subserver v) request respond
+  route Proxy subserver = WithRequest $ \ request ->
+    route (Proxy :: Proxy sublayout) $ do
+      -- See HTTP RFC 2616, section 7.2.1
+      -- http://www.w3.org/Protocols/rfc2616/rfc2616-sec7.html#sec7.2.1
+      -- See also "W3C Internet Media Type registration, consistency of use"
+      -- http://www.w3.org/2001/tag/2002/0129-mime
+      let contentTypeH = fromMaybe "application/octet-stream"
+                       $ lookup hContentType $ requestHeaders request
+      mrqbody <- handleCTypeH (Proxy :: Proxy list) (cs contentTypeH)
+             <$> lazyRequestBody request
+      case mrqbody of
+        Nothing -> return $ failWith $ UnsupportedMediaType
+        Just (Left e) -> return $ failWith $ InvalidBody e
+        Just (Right v) -> feedTo subserver v
 
 -- | Make sure the incoming request starts with @"/path"@, strip it and
 -- pass the rest of the request path to @sublayout@.
@@ -1008,14 +1073,9 @@ instance (KnownSymbol path, HasServer sublayout) => HasServer (path :> sublayout
 
   type ServerT (path :> sublayout) m = ServerT sublayout m
 
-  route Proxy subserver request respond = case processedPathInfo request of
-    (first : rest)
-      | first == cs (symbolVal proxyPath)
-      -> route (Proxy :: Proxy sublayout) subserver request{
-           pathInfo = rest
-         } respond
-    _ -> respond $ failWith NotFound
-
+  route Proxy subserver = StaticRouter $
+    M.singleton (cs (symbolVal proxyPath))
+                (route (Proxy :: Proxy sublayout) subserver)
     where proxyPath = Proxy :: Proxy path
 
 ct_wildcard :: B.ByteString
