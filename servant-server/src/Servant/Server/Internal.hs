@@ -61,7 +61,7 @@ data Router =
   | LeafRouter    RoutingApplication
   | Choice        Router Router
 
--- TODO: There are potentially more cases we can optimize!
+-- TODO: There are potentially many more cases we can optimize!
 choice :: Router -> Router -> Router
 choice (StaticRouter table1) (StaticRouter table2) =
   StaticRouter (M.unionWith choice table1 table2)
@@ -170,13 +170,19 @@ newtype RouteResult a =
   deriving (Eq, Show, Functor, Applicative)
 
 runAction :: IO (RouteResult (EitherT ServantErr IO a))
-          -> IO (Either RouteMismatch (Either ServantErr a))
-runAction action = do
+          -> (RouteResult Response -> IO r)
+          -> (a -> RouteResult Response)
+          -> IO r
+runAction action respond k = do
   r <- action
   go r
   where
-    go (RR (Right a))  = Right <$> runEitherT a
-    go (RR (Left err)) = return $ Left err
+    go (RR (Right a))  = do
+      e <- runEitherT a
+      respond $ case e of
+        Right x  -> k x
+        Left err -> succeedWith $ responseServantErr err
+    go (RR (Left err)) = respond $ failWith err
 
 feedTo :: IO (RouteResult (a -> b)) -> a -> IO (RouteResult b)
 feedTo f x = (($ x) <$>) <$> f
@@ -331,16 +337,12 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodDelete = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right output) -> do
-                let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                  Nothing -> failWith UnsupportedMediaType
-                  Just (contentT, body) -> succeedWith $
-                    responseLBS status200 [ ("Content-Type" , cs contentT)] body
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err         -> failWith err
+            runAction action respond $ \ output -> do
+              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
+                Nothing -> failWith UnsupportedMediaType
+                Just (contentT, body) -> succeedWith $
+                  responseLBS status200 [ ("Content-Type" , cs contentT)] body
         | pathIsEmpty request && requestMethod request /= methodDelete =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -357,11 +359,8 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodDelete = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err         -> failWith err
+            runAction action respond $ \ () ->
+              succeedWith $ responseLBS noContent204 [] ""
         | pathIsEmpty request && requestMethod request /= methodDelete =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -380,17 +379,13 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodDelete = do
-          e <- runAction action
-          respond $ case e of
-            Right (Right output) -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                  headers = getHeaders output
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
-            Right (Left err) -> succeedWith $ responseServantErr err
-            Left err -> failWith err
+          runAction action respond $ \ output -> do
+            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                headers = getHeaders output
+            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
+              Nothing -> failWith UnsupportedMediaType
+              Just (contentT, body) -> succeedWith $
+                responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
         | pathIsEmpty request && requestMethod request /= methodDelete =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -420,16 +415,12 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodGet = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right output) -> do
-                let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                  Nothing -> failWith UnsupportedMediaType
-                  Just (contentT, body) -> succeedWith $
-                    responseLBS ok200 [ ("Content-Type" , cs contentT)] body
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err -> failWith err
+            runAction action respond $ \ output -> do
+              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
+                Nothing -> failWith UnsupportedMediaType
+                Just (contentT, body) -> succeedWith $
+                  responseLBS ok200 [ ("Content-Type" , cs contentT)] body
         | pathIsEmpty request && requestMethod request /= methodGet =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -447,11 +438,8 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodGet = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err         -> failWith err
+            runAction action respond $ \ () ->
+              succeedWith $ responseLBS noContent204 [] ""
         | pathIsEmpty request && requestMethod request /= methodGet =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -470,17 +458,13 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodGet = do
-          e <- runAction action
-          respond $ case e of
-            Right (Right output) -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                  headers = getHeaders output
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS ok200 ( ("Content-Type" , cs contentT) : headers) body
-            Right (Left err) -> succeedWith $ responseServantErr err
-            Left err         -> failWith err
+          runAction action respond $ \ output -> do
+            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                headers = getHeaders output
+            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
+              Nothing -> failWith UnsupportedMediaType
+              Just (contentT, body) -> succeedWith $
+                responseLBS ok200 ( ("Content-Type" , cs contentT) : headers) body
         | pathIsEmpty request && requestMethod request /= methodGet =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -542,16 +526,12 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodPost = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right output) -> do
-                let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                  Nothing -> failWith UnsupportedMediaType
-                  Just (contentT, body) -> succeedWith $
-                    responseLBS status201 [ ("Content-Type" , cs contentT)] body
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err -> failWith err
+            runAction action respond $ \ output -> do
+              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
+                Nothing -> failWith UnsupportedMediaType
+                Just (contentT, body) -> succeedWith $
+                  responseLBS status201 [ ("Content-Type" , cs contentT)] body
         | pathIsEmpty request && requestMethod request /= methodPost =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -568,11 +548,8 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodPost = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err         -> failWith err
+            runAction action respond $ \ () ->
+              succeedWith $ responseLBS noContent204 [] ""
         | pathIsEmpty request && requestMethod request /= methodPost =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -591,17 +568,13 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodPost = do
-          e <- runAction action
-          respond $ case e of
-            Right (Right output) -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                  headers = getHeaders output
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS status201 ( ("Content-Type" , cs contentT) : headers) body
-            Right (Left err) -> succeedWith $ responseServantErr err
-            Left err         -> failWith err
+          runAction action respond $ \ output -> do
+            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                headers = getHeaders output
+            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
+              Nothing -> failWith UnsupportedMediaType
+              Just (contentT, body) -> succeedWith $
+                responseLBS status201 ( ("Content-Type" , cs contentT) : headers) body
         | pathIsEmpty request && requestMethod request /= methodPost =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -631,16 +604,12 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodPut = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right output) -> do
-                let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                  Nothing -> failWith UnsupportedMediaType
-                  Just (contentT, body) -> succeedWith $
-                    responseLBS status200 [ ("Content-Type" , cs contentT)] body
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err -> failWith err
+            runAction action respond $ \ output -> do
+              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
+                Nothing -> failWith UnsupportedMediaType
+                Just (contentT, body) -> succeedWith $
+                  responseLBS status200 [ ("Content-Type" , cs contentT)] body
         | pathIsEmpty request && requestMethod request /= methodPut =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -657,11 +626,8 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodPut = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err         -> failWith err
+            runAction action respond $ \ () ->
+              succeedWith $ responseLBS noContent204 [] ""
         | pathIsEmpty request && requestMethod request /= methodPut =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -680,17 +646,13 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodPut = do
-          e <- runAction action
-          respond $ case e of
-            Right (Right output) -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                  headers = getHeaders output
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
-            Right (Left err) -> succeedWith $ responseServantErr err
-            Left err -> failWith err
+          runAction action respond $ \ output -> do
+            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                headers = getHeaders output
+            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
+              Nothing -> failWith UnsupportedMediaType
+              Just (contentT, body) -> succeedWith $
+                responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
         | pathIsEmpty request && requestMethod request /= methodPut =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -718,16 +680,12 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodPatch = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right output) -> do
-                let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                  Nothing -> failWith UnsupportedMediaType
-                  Just (contentT, body) -> succeedWith $
-                    responseLBS status200 [ ("Content-Type" , cs contentT)] body
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err -> failWith err
+            runAction action respond $ \ output -> do
+              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
+                Nothing -> failWith UnsupportedMediaType
+                Just (contentT, body) -> succeedWith $
+                  responseLBS status200 [ ("Content-Type" , cs contentT)] body
         | pathIsEmpty request && requestMethod request /= methodPatch =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -744,11 +702,8 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodPatch = do
-            e <- runAction action
-            respond $ case e of
-              Right (Right ()) -> succeedWith $ responseLBS noContent204 [] ""
-              Right (Left err) -> succeedWith $ responseServantErr err
-              Left err         -> failWith err
+            runAction action respond $ \ () ->
+              succeedWith $ responseLBS noContent204 [] ""
         | pathIsEmpty request && requestMethod request /= methodPatch =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
@@ -767,17 +722,13 @@ instance
     where
       route' request respond
         | pathIsEmpty request && requestMethod request == methodPatch = do
-          e <- runAction action
-          respond $ case e of
-            Right (Right outpatch) -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                  headers = getHeaders outpatch
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse outpatch) of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
-            Right (Left err) -> succeedWith $ responseServantErr err
-            Left err -> failWith err
+          runAction action respond $ \ outpatch -> do
+            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+                headers = getHeaders outpatch
+            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse outpatch) of
+              Nothing -> failWith UnsupportedMediaType
+              Just (contentT, body) -> succeedWith $
+                responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
         | pathIsEmpty request && requestMethod request /= methodPatch =
             respond $ failWith WrongMethod
         | otherwise = respond $ failWith NotFound
