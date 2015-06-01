@@ -6,13 +6,14 @@ module Servant.Server.Internal.RoutingApplication where
 
 #if !MIN_VERSION_base(4,8,0)
 import           Control.Applicative         (Applicative, (<$>))
-import           Data.Monoid                 (Monoid, mappend, mempty, (<>))
+import           Data.Monoid                 (Monoid, mappend, mempty)
 #endif
 import           Control.Monad.Trans.Either  (EitherT, runEitherT)
 import qualified Data.ByteString             as B
 import qualified Data.ByteString.Lazy        as BL
 import           Data.IORef                  (newIORef, readIORef, writeIORef)
 import           Data.Maybe                  (fromMaybe)
+import           Data.Monoid                 ((<>))
 import           Data.String                 (fromString)
 import           Network.HTTP.Types          hiding (Header, ResponseHeaders)
 import           Network.Wai                 (Application, Request, Response,

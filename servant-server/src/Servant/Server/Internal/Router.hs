@@ -1,11 +1,8 @@
-{-# LANGUAGE CPP                        #-}
 module Servant.Server.Internal.Router where
 
-#if !MIN_VERSION_base(4,8,0)
-import           Data.Monoid                 ((<>))
-#endif
 import           Data.Map                    (Map)
 import qualified Data.Map                    as M
+import           Data.Monoid                 ((<>))
 import           Data.Text                   (Text)
 import           Network.Wai                 (Request, pathInfo)
 import           Servant.Server.Internal.PathInfo
