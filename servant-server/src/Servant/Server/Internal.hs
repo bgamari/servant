@@ -114,6 +114,56 @@ instance (KnownSymbol capture, FromText a, HasServer sublayout)
     where captureProxy = Proxy :: Proxy (Capture capture a)
 
 
+methodRouter :: (AllCTRender ctypes a)
+             => Method -> Proxy ctypes -> Status
+             -> IO (RouteResult (EitherT ServantErr IO a))
+             -> Router
+methodRouter method proxy status action = LeafRouter route'
+  where
+    route' request respond
+      | pathIsEmpty request && requestMethod request == method = do
+          runAction action respond $ \ output -> do
+            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+            case handleAcceptH proxy (AcceptHeader accH) output of
+              Nothing -> failWith UnsupportedMediaType
+              Just (contentT, body) -> succeedWith $
+                responseLBS status [ ("Content-Type" , cs contentT)] body
+      | pathIsEmpty request && requestMethod request /= method =
+          respond $ failWith WrongMethod
+      | otherwise = respond $ failWith NotFound
+
+methodRouterHeaders :: (GetHeaders (Headers h v), AllCTRender ctypes v)
+                    => Method -> Proxy ctypes -> Status
+                    -> IO (RouteResult (EitherT ServantErr IO (Headers h v)))
+                    -> Router
+methodRouterHeaders method proxy status action = LeafRouter route'
+  where
+    route' request respond
+      | pathIsEmpty request && requestMethod request == method = do
+        runAction action respond $ \ output -> do
+          let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
+              headers = getHeaders output
+          case handleAcceptH proxy (AcceptHeader accH) (getResponse output) of
+            Nothing -> failWith UnsupportedMediaType
+            Just (contentT, body) -> succeedWith $
+              responseLBS status ( ("Content-Type" , cs contentT) : headers) body
+      | pathIsEmpty request && requestMethod request /= method =
+          respond $ failWith WrongMethod
+      | otherwise = respond $ failWith NotFound
+
+methodRouterEmpty :: Method
+                  -> IO (RouteResult (EitherT ServantErr IO ()))
+                  -> Router
+methodRouterEmpty method action = LeafRouter route'
+  where
+    route' request respond
+      | pathIsEmpty request && requestMethod request == method = do
+          runAction action respond $ \ () ->
+            succeedWith $ responseLBS noContent204 [] ""
+      | pathIsEmpty request && requestMethod request /= method =
+          respond $ failWith WrongMethod
+      | otherwise = respond $ failWith NotFound
+
 -- | If you have a 'Delete' endpoint in your API,
 -- the handler for this endpoint is meant to delete
 -- a resource.
@@ -134,19 +184,7 @@ instance
 
   type ServerT (Delete ctypes a) m = m a
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodDelete = do
-            runAction action respond $ \ output -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS status200 [ ("Content-Type" , cs contentT)] body
-        | pathIsEmpty request && requestMethod request /= methodDelete =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouter methodDelete (Proxy :: Proxy ctypes) ok200
 
 instance
 #if MIN_VERSION_base(4,8,0)
@@ -156,15 +194,7 @@ instance
 
   type ServerT (Delete ctypes ()) m = m ()
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodDelete = do
-            runAction action respond $ \ () ->
-              succeedWith $ responseLBS noContent204 [] ""
-        | pathIsEmpty request && requestMethod request /= methodDelete =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterEmpty methodDelete
 
 -- Add response headers
 instance
@@ -176,20 +206,7 @@ instance
 
   type ServerT (Delete ctypes (Headers h v)) m = m (Headers h v)
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodDelete = do
-          runAction action respond $ \ output -> do
-            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                headers = getHeaders output
-            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-              Nothing -> failWith UnsupportedMediaType
-              Just (contentT, body) -> succeedWith $
-                responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
-        | pathIsEmpty request && requestMethod request /= methodDelete =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterHeaders methodDelete (Proxy :: Proxy ctypes) ok200
 
 -- | When implementing the handler for a 'Get' endpoint,
 -- just like for 'Servant.API.Delete.Delete', 'Servant.API.Post.Post'
@@ -212,19 +229,7 @@ instance
 
   type ServerT (Get ctypes a) m = m a
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodGet = do
-            runAction action respond $ \ output -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS ok200 [ ("Content-Type" , cs contentT)] body
-        | pathIsEmpty request && requestMethod request /= methodGet =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouter methodGet (Proxy :: Proxy ctypes) ok200
 
 -- '()' ==> 204 No Content
 instance
@@ -235,15 +240,7 @@ instance
 
   type ServerT (Get ctypes ()) m = m ()
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodGet = do
-            runAction action respond $ \ () ->
-              succeedWith $ responseLBS noContent204 [] ""
-        | pathIsEmpty request && requestMethod request /= methodGet =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterEmpty methodGet
 
 -- Add response headers
 instance
@@ -255,20 +252,7 @@ instance
 
   type ServerT (Get ctypes (Headers h v)) m = m (Headers h v)
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodGet = do
-          runAction action respond $ \ output -> do
-            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                headers = getHeaders output
-            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-              Nothing -> failWith UnsupportedMediaType
-              Just (contentT, body) -> succeedWith $
-                responseLBS ok200 ( ("Content-Type" , cs contentT) : headers) body
-        | pathIsEmpty request && requestMethod request /= methodGet =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterHeaders methodGet (Proxy :: Proxy ctypes) ok200
 
 -- | If you use 'Header' in one of the endpoints for your API,
 -- this automatically requires your server-side handler to be a function
@@ -323,19 +307,7 @@ instance
 
   type ServerT (Post ctypes a) m = m a
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodPost = do
-            runAction action respond $ \ output -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS status201 [ ("Content-Type" , cs contentT)] body
-        | pathIsEmpty request && requestMethod request /= methodPost =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouter methodPost (Proxy :: Proxy ctypes) created201
 
 instance
 #if MIN_VERSION_base(4,8,0)
@@ -345,15 +317,7 @@ instance
 
   type ServerT (Post ctypes ()) m = m ()
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodPost = do
-            runAction action respond $ \ () ->
-              succeedWith $ responseLBS noContent204 [] ""
-        | pathIsEmpty request && requestMethod request /= methodPost =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterEmpty methodPost
 
 -- Add response headers
 instance
@@ -365,20 +329,7 @@ instance
 
   type ServerT (Post ctypes (Headers h v)) m = m (Headers h v)
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodPost = do
-          runAction action respond $ \ output -> do
-            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                headers = getHeaders output
-            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-              Nothing -> failWith UnsupportedMediaType
-              Just (contentT, body) -> succeedWith $
-                responseLBS status201 ( ("Content-Type" , cs contentT) : headers) body
-        | pathIsEmpty request && requestMethod request /= methodPost =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterHeaders methodPost (Proxy :: Proxy ctypes) created201
 
 -- | When implementing the handler for a 'Put' endpoint,
 -- just like for 'Servant.API.Delete.Delete', 'Servant.API.Get.Get'
@@ -401,19 +352,7 @@ instance
 
   type ServerT (Put ctypes a) m = m a
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodPut = do
-            runAction action respond $ \ output -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS status200 [ ("Content-Type" , cs contentT)] body
-        | pathIsEmpty request && requestMethod request /= methodPut =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouter methodPut (Proxy :: Proxy ctypes) ok200
 
 instance
 #if MIN_VERSION_base(4,8,0)
@@ -423,15 +362,7 @@ instance
 
   type ServerT (Put ctypes ()) m = m ()
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodPut = do
-            runAction action respond $ \ () ->
-              succeedWith $ responseLBS noContent204 [] ""
-        | pathIsEmpty request && requestMethod request /= methodPut =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterEmpty methodPut
 
 -- Add response headers
 instance
@@ -443,20 +374,7 @@ instance
 
   type ServerT (Put ctypes (Headers h v)) m = m (Headers h v)
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodPut = do
-          runAction action respond $ \ output -> do
-            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                headers = getHeaders output
-            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse output) of
-              Nothing -> failWith UnsupportedMediaType
-              Just (contentT, body) -> succeedWith $
-                responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
-        | pathIsEmpty request && requestMethod request /= methodPut =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterHeaders methodPut (Proxy :: Proxy ctypes) ok200
 
 -- | When implementing the handler for a 'Patch' endpoint,
 -- just like for 'Servant.API.Delete.Delete', 'Servant.API.Get.Get'
@@ -477,19 +395,7 @@ instance
 
   type ServerT (Patch ctypes a) m = m a
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodPatch = do
-            runAction action respond $ \ output -> do
-              let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-              case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) output of
-                Nothing -> failWith UnsupportedMediaType
-                Just (contentT, body) -> succeedWith $
-                  responseLBS status200 [ ("Content-Type" , cs contentT)] body
-        | pathIsEmpty request && requestMethod request /= methodPatch =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouter methodPatch (Proxy :: Proxy ctypes) ok200
 
 instance
 #if MIN_VERSION_base(4,8,0)
@@ -499,15 +405,7 @@ instance
 
   type ServerT (Patch ctypes ()) m = m ()
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodPatch = do
-            runAction action respond $ \ () ->
-              succeedWith $ responseLBS noContent204 [] ""
-        | pathIsEmpty request && requestMethod request /= methodPatch =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterEmpty methodPatch
 
 -- Add response headers
 instance
@@ -519,20 +417,7 @@ instance
 
   type ServerT (Patch ctypes (Headers h v)) m = m (Headers h v)
 
-  route Proxy action = LeafRouter route'
-    where
-      route' request respond
-        | pathIsEmpty request && requestMethod request == methodPatch = do
-          runAction action respond $ \ outpatch -> do
-            let accH = fromMaybe ct_wildcard $ lookup hAccept $ requestHeaders request
-                headers = getHeaders outpatch
-            case handleAcceptH (Proxy :: Proxy ctypes) (AcceptHeader accH) (getResponse outpatch) of
-              Nothing -> failWith UnsupportedMediaType
-              Just (contentT, body) -> succeedWith $
-                responseLBS status200 ( ("Content-Type" , cs contentT) : headers) body
-        | pathIsEmpty request && requestMethod request /= methodPatch =
-            respond $ failWith WrongMethod
-        | otherwise = respond $ failWith NotFound
+  route Proxy = methodRouterHeaders methodPatch (Proxy :: Proxy ctypes) ok200
 
 -- | If you use @'QueryParam' "author" Text@ in one of the endpoints for your API,
 -- this automatically requires your server-side handler to be a function
