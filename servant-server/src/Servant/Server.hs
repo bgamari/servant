@@ -81,6 +81,8 @@ import           Data.Proxy                         (Proxy)
 import           Network.Wai                        (Application)
 import           Servant.Server.Internal
 import           Servant.Server.Internal.Enter
+import           Servant.Server.Internal.Router
+import           Servant.Server.Internal.RoutingApplication
 import           Servant.Server.Internal.ServantErr
 
 
