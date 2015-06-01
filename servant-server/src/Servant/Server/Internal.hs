@@ -12,7 +12,13 @@
 {-# LANGUAGE OverlappingInstances #-}
 #endif
 
-module Servant.Server.Internal where
+module Servant.Server.Internal
+  ( module Servant.Server.Internal
+  , module Servant.Server.Internal.PathInfo
+  , module Servant.Server.Internal.Router
+  , module Servant.Server.Internal.RoutingApplication
+  , module Servant.Server.Internal.ServantErr
+  ) where
 
 #if !MIN_VERSION_base(4,8,0)
 import           Control.Applicative         ((<$>))
