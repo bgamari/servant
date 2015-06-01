@@ -597,7 +597,7 @@ prioErrorsSpec = describe "PrioErrors" $ do
                      ++ " " ++ cs path ++ " (" ++ cdescr ++ ")"
 
         get' = ("GET", methodGet)
-        put' = ("PUT", methodPut )
+        put' = ("PUT", methodPut)
 
         txt   = ("text"        , "text/plain;charset=utf8"      , "42"        )
         ijson = ("invalid json", "application/json;charset=utf8", "invalid"   )
